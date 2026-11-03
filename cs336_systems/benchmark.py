@@ -1,5 +1,12 @@
-
 """End-to-end benchmarking for the CS336 basics Transformer."""
+
+import torch.cuda.nvtx as nvtx
+
+import cs336_basics.model as basics_model
+
+from cs336_systems.annotated_attention import (
+    annotated_scaled_dot_product_attention,
+)
 
 import argparse
 import statistics
@@ -12,11 +19,11 @@ from cs336_basics.model import BasicsTransformerLM
 
 
 MODEL_CONFIGS = {
-    "small":  {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
+    "small": {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
     "medium": {"d_model": 1024, "d_ff": 4096, "num_layers": 24, "num_heads": 16},
-    "large":  {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
-    "xl":     {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
-    "10B":    {"d_model": 4608, "d_ff": 12288, "num_layers": 50, "num_heads": 36},
+    "large": {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
+    "xl": {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
+    "10B": {"d_model": 4608, "d_ff": 12288, "num_layers": 50, "num_heads": 36},
 }
 
 
@@ -66,15 +73,23 @@ def run_step(model, optimizer, x, targets, mode):
     if mode != "forward":
         optimizer.zero_grad(set_to_none=True)
 
-    logits = model(x)  # Forward
+    # forward
+    with nvtx.range("forward"):
+        logits = model(x)
 
     if mode != "forward":
-        # Cross-entropy expects (batch, vocab_size, sequence_length).
-        loss = F.cross_entropy(logits.transpose(1, 2), targets)
-        loss.backward()  # Backward
+        # Loss computation
+        with nvtx.range("loss"):
+            loss = F.cross_entropy(logits.transpose(1, 2), targets)
 
+        # Backward
+        with nvtx.range("backward"):
+            loss.backward()
+
+    # optimizer
     if mode == "full_step":
-        optimizer.step()  # Update parameters
+        with nvtx.range("optimizer"):
+            optimizer.step()  # Update parameters
 
 
 def main():
@@ -108,12 +123,14 @@ def main():
 
     # Same random batch is reused, so data generation is not timed.
     x = torch.randint(
-        0, args.vocab_size,
+        0,
+        args.vocab_size,
         (args.batch_size, args.context_length),
         device=device,
     )
     targets = torch.randint(
-        0, args.vocab_size,
+        0,
+        args.vocab_size,
         (args.batch_size, args.context_length),
         device=device,
     )
@@ -122,19 +139,23 @@ def main():
     print(f"Mode: {args.mode} | Device: {device} | Dtype: {args.dtype}")
     print(f"Warm-up: {args.warmup} | Measured steps: {args.steps}")
 
+    basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
     # Warm-up: execute but do not record times.
-    for _ in range(args.warmup):
-        run_step(model, optimizer, x, targets, args.mode)
-        synchronize(device)
+    with nvtx.range("warmup"):
+        for _ in range(args.warmup):
+            run_step(model, optimizer, x, targets, args.mode)
+            synchronize(device)
 
     # Measure each complete step, waiting for the GPU to finish.
     times_ms = []
-    for _ in range(args.steps):
-        synchronize(device)
-        start = default_timer()
-        run_step(model, optimizer, x, targets, args.mode)
-        synchronize(device)
-        times_ms.append((default_timer() - start) * 1000)
+    with nvtx.range("measurement"):
+        for _ in range(args.steps):
+            synchronize(device)
+            start = default_timer()
+            run_step(model, optimizer, x, targets, args.mode)
+            synchronize(device)
+            times_ms.append((default_timer() - start) * 1000)
 
     mean_ms = statistics.mean(times_ms)
     std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
@@ -145,8 +166,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
