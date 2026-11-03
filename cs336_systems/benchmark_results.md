@@ -82,8 +82,9 @@ Notes / OOM:
 
 ## (c) Warmup ablation
 
-Setting: `small`, `--mode forward`, `steps=10`, RTX 4090.  
-(Only forward was run for the warmup sweep so far.)
+Setting: `--mode forward`, `steps=10`, RTX 4090.
+
+### small
 
 | Warmup | Mean (ms) | Std (ms) | Notes |
 |--------|-----------|----------|-------|
@@ -102,6 +103,21 @@ Raw step times:
 - warmup=2: `[24.46, 24.42, 24.51, 24.45, 24.48, 24.51, 24.49, 24.33, 24.38, 24.34]`
 - warmup=3: `[24.48, 24.48, 24.48, 24.48, 24.54, 24.47, 24.5, 24.4, 24.43, 24.37]`
 
+### medium
+
+| Warmup | Mean (ms) | Std (ms) | Notes |
+|--------|-----------|----------|-------|
+| 0 | 94.29 | 62.31 | first measured step is a huge outlier |
+| 1 | 74.53 | 0.39 | |
+| 2 | 74.57 | 0.20 | |
+| 5 (from b) | 74.79 | 0.29 | baseline |
+
+Raw step times:
+
+- warmup=0: `[271.62, 74.37, 75.15, 74.36, 74.36, 74.34, 74.54, 74.32, 75.03, 74.86]`
+- warmup=1: `[74.33, 74.36, 74.43, 74.59, 74.36, 74.5, 74.37, 74.41, 74.36, 75.61]`
+- warmup=2: `[74.39, 74.7, 75.02, 74.44, 74.73, 74.53, 74.49, 74.64, 74.39, 74.41]`
+
 ## Writeup scratch
 
 ### (b) 1–2 sentences
@@ -110,4 +126,4 @@ On RTX 4090, the small model takes 24.46±0.10 ms for forward, about 65.6 ms for
 
 ### (c) 2–3 sentences
 
-With zero warm-up, the mean jumps to 45.88 ms and the std to 67.52 ms because the first measured step takes ~238 ms (CUDA context / cuBLAS init / allocator warmup), while later steps stay ~24.5 ms. With 1–3 warm-up steps, the mean (~24.4–24.5 ms) already matches the warmup=5 baseline, and the std stays small; remaining tiny differences are likely residual allocator / autotune noise rather than a large bias.
+With zero warm-up, the mean/std blow up because the first measured step is much slower (small: ~238 ms vs ~24.5 ms steady-state; medium: ~272 ms vs ~74.5 ms), consistent with one-time CUDA/cuBLAS/allocator initialization. With 1–2 warm-up steps, both models already match the warmup=5 baseline within noise, so a few warm-up steps are enough to remove the cold-start bias.
