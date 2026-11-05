@@ -1,22 +1,17 @@
-"""End-to-end benchmarking for the CS336 basics Transformer."""
 
-import torch.cuda.nvtx as nvtx
-
-import cs336_basics.model as basics_model
-
-from cs336_systems.annotated_attention import (
-    annotated_scaled_dot_product_attention,
-)
 
 import argparse
 import statistics
-from timeit import default_timer
 from contextlib import nullcontext
+from timeit import default_timer
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 
+import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
+from cs336_systems.annotated_attention import annotated_scaled_dot_product_attention
 
 
 MODEL_CONFIGS = {
@@ -53,10 +48,10 @@ def parse_args():
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument(
-    "--mixed-precision",
-    action="store_true",
-    help="Enable BF16 autocast while keeping model parameters in FP32",
-)
+        "--mixed-precision",
+        action="store_true",
+        help="Use BF16 autocast while keeping model parameters in FP32.",
+    )
 
     args = parser.parse_args()
     if args.warmup < 0 or args.steps < 1:
@@ -64,7 +59,11 @@ def parse_args():
     if min(args.batch_size, args.context_length, args.vocab_size) < 1:
         parser.error("Batch size, context length, and vocab size must be positive")
     if args.device == "cuda" and not torch.cuda.is_available():
-        parser.error("CUDA is unavailable. Use an NVIDIA GPU, or --device cpu for a smoke test")
+        parser.error("CUDA is unavailable. Use an NVIDIA GPU.")
+    if args.mixed_precision and args.device != "cuda":
+        parser.error("--mixed-precision requires --device cuda")
+    if args.mixed_precision and args.dtype != "float32":
+        parser.error("Use --dtype float32 together with --mixed-precision")
     return args
 
 
@@ -74,44 +73,37 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
-
 def run_step(model, optimizer, x, targets, mode, mixed_precision=False):
-    """Run one benchmark step with optional BF16 autocast."""
-
+    """Run one step, optionally enabling BF16 autocast for forward and loss."""
     if mode != "forward":
         optimizer.zero_grad(set_to_none=True)
 
-    if mixed_precision:
-        precision_context = torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-        )
-    else:
-        precision_context = nullcontext()
+    precision_context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if mixed_precision
+        else nullcontext()
+    )
 
+    # Autocast is used for forward/loss, not for backward or optimizer.
     with precision_context:
-        # Forward
         with nvtx.range("forward"):
             logits = model(x)
-            print("Logits dtype:", logits.dtype)
 
         if mode != "forward":
-            # Loss
             with nvtx.range("loss"):
-                loss = F.cross_entropy(
-                    logits.transpose(1, 2), targets
-                )
+                loss = F.cross_entropy(logits.transpose(1, 2), targets)
 
-    # Backward
     if mode != "forward":
         with nvtx.range("backward"):
             loss.backward()
 
-    # Optimizer
     if mode == "full_step":
         with nvtx.range("optimizer"):
             optimizer.step()
 
+    # A dtype is only metadata; printing it outside the timed loop avoids
+    # print overhead in the measurements.
+    return logits.dtype
 
 
 def main():
@@ -133,12 +125,9 @@ def main():
 
     device = torch.device(args.device)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
-    if args.mixed_precision:
-        if args.device != "cuda":
-            raise ValueError("BF16 mixed precision requires CUDA")
-        if args.dtype != "float32":
-            raise ValueError("Use --dtype float32 with --mixed-precision")
 
+    # With --mixed-precision, args.dtype must be float32, so the stored
+    # model parameters stay FP32 while eligible operations use BF16.
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -148,7 +137,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    # Same random batch is reused, so data generation is not timed.
+    # Reuse the same random batch; data generation is not timed.
     x = torch.randint(
         0,
         args.vocab_size,
@@ -162,31 +151,45 @@ def main():
         device=device,
     )
 
+    precision_name = (
+        "BF16 autocast (FP32 parameters)"
+        if args.mixed_precision
+        else f"No autocast ({args.dtype} parameters)"
+    )
     print(f"Model: {args.model_size} {config}")
-    print(f"Mode: {args.mode} | Device: {device} | Dtype: {args.dtype}")
+    print(f"Mode: {args.mode} | Device: {device} | Precision: {precision_name}")
     print(f"Warm-up: {args.warmup} | Measured steps: {args.steps}")
 
+    # Preserve NVTX annotations used for the earlier Nsight experiments.
     basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
-    # Warm-up: execute but do not record times.
     with nvtx.range("warmup"):
         for _ in range(args.warmup):
-            run_step(model, optimizer, x, targets, args.mode)
+            run_step(
+                model, optimizer, x, targets, args.mode,
+                mixed_precision=args.mixed_precision,
+            )
             synchronize(device)
 
-    # Measure each complete step, waiting for the GPU to finish.
     times_ms = []
+    last_logits_dtype = None
+
     with nvtx.range("measurement"):
         for _ in range(args.steps):
             synchronize(device)
             start = default_timer()
-            run_step(model, optimizer, x, targets, args.mode)
+            last_logits_dtype = run_step(
+                model, optimizer, x, targets, args.mode,
+                mixed_precision=args.mixed_precision,
+            )
             synchronize(device)
             times_ms.append((default_timer() - start) * 1000)
 
     mean_ms = statistics.mean(times_ms)
     std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
 
+    print(f"Parameter dtype: {next(model.parameters()).dtype}")
+    print(f"Logits dtype: {last_logits_dtype}")
     print(f"Step times (ms): {[round(t, 2) for t in times_ms]}")
     print(f"Mean: {mean_ms:.2f} ms | Std: {std_ms:.2f} ms")
 
