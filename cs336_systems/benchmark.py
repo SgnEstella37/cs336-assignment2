@@ -11,6 +11,7 @@ from cs336_systems.annotated_attention import (
 import argparse
 import statistics
 from timeit import default_timer
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +52,11 @@ def parse_args():
 
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument(
+    "--mixed-precision",
+    action="store_true",
+    help="Enable BF16 autocast while keeping model parameters in FP32",
+)
 
     args = parser.parse_args()
     if args.warmup < 0 or args.steps < 1:
@@ -68,28 +74,43 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
-def run_step(model, optimizer, x, targets, mode):
-    """Run one step in the requested measurement mode."""
+
+def run_step(model, optimizer, x, targets, mode, mixed_precision=False):
+    """Run one benchmark step with optional BF16 autocast."""
+
     if mode != "forward":
         optimizer.zero_grad(set_to_none=True)
 
-    # forward
-    with nvtx.range("forward"):
-        logits = model(x)
+    if mixed_precision:
+        precision_context = torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+        )
+    else:
+        precision_context = nullcontext()
 
+    with precision_context:
+        # Forward
+        with nvtx.range("forward"):
+            logits = model(x)
+
+        if mode != "forward":
+            # Loss
+            with nvtx.range("loss"):
+                loss = F.cross_entropy(
+                    logits.transpose(1, 2), targets
+                )
+
+    # Backward
     if mode != "forward":
-        # Loss computation
-        with nvtx.range("loss"):
-            loss = F.cross_entropy(logits.transpose(1, 2), targets)
-
-        # Backward
         with nvtx.range("backward"):
             loss.backward()
 
-    # optimizer
+    # Optimizer
     if mode == "full_step":
         with nvtx.range("optimizer"):
-            optimizer.step()  # Update parameters
+            optimizer.step()
+
 
 
 def main():
@@ -111,6 +132,11 @@ def main():
 
     device = torch.device(args.device)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
+    if args.mixed_precision:
+        if args.device != "cuda":
+            raise ValueError("BF16 mixed precision requires CUDA")
+        if args.dtype != "float32":
+            raise ValueError("Use --dtype float32 with --mixed-precision")
 
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
