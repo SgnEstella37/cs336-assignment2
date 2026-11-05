@@ -93,6 +93,7 @@ def run_step(model, optimizer, x, targets, mode, mixed_precision=False):
         # Forward
         with nvtx.range("forward"):
             logits = model(x)
+            print("Logits dtype:", logits.dtype)
 
         if mode != "forward":
             # Loss
